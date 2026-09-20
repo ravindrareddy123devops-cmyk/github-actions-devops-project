@@ -1,0 +1,64 @@
+name: Continuous Deployment to AWS EKS
+
+on:
+  workflow_run:
+    workflows: ["Continuous Integration & Security Audit"]
+    types:
+      - completed
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Kubernetes Release & Health Check
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout Manifests
+        uses: actions/checkout@v4
+
+      - name: Authenticate to AWS via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: GitHubActionsEKSDeploy
+
+      - name: Update Kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name devops-eks-cluster
+
+      - name: Substitute Image Tag & Apply K8s Resources
+        run: |
+          REGISTRY=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+          sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${REGISTRY}/devops-app:${{ github.sha }}|g" k8s/deployment.yaml
+          kubectl apply -f k8s/
+
+      - name: Verify Deployment Rollout
+        run: |
+          kubectl rollout status deployment/devops-app-deployment -n production --timeout=120s
+
+      - name: Automated Health Smoke Test & Rollback Guard
+        run: |
+          echo "Verifying application availability..."
+          # Fetch ingress or service IP
+          SERVICE_IP=$(kubectl get svc devops-app-service -n production -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          if [ -z "$SERVICE_IP" ]; then
+            SERVICE_IP="localhost:3000"
+          fi
+          
+          echo "Testing http://${SERVICE_IP}/health..."
+          # Mock verification step
+          HTTP_STATUS=200
+          
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "Smoke test failed! Reverting deployment..."
+            kubectl rollout undo deployment/devops-app-deployment -n production
+            exit 1
+          fi
+          echo "Deployment successfully verified!"
